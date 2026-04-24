@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tierzero"
+version = "0.1.0"
+description = "Survivorship-bias-free US equity data pipeline with point-in-time fundamentals"
+requires-python = ">=3.11"
+dependencies = [
+    "yfinance>=0.2.40",
+    "pandas>=2.2.0",
+    "polars>=0.20.0",
+    "duckdb>=0.10.0",
+    "pyarrow>=15.0.0",
+    "requests>=2.31.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.1.0",
+    "tqdm>=4.66.0",
+    "python-dotenv>=1.0.0",
+    "tenacity>=8.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=5.0.0",
+    "pytest-xdist>=3.5.0",
+    "hypothesis>=6.100.0",
+    "freezegun>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=src/tierzero --cov-report=term-missing -v"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tierzero"]
