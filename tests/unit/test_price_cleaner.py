@@ -110,7 +110,10 @@ class TestClean:
     def test_non_positive_close_removed(self):
         df = self._make_raw_df()
         cleaned = PriceCleaner().clean(df, "TEST")
-        assert all(cleaned["close_unadj"] > 0)
+        # clean() keeps yfinance's column names; the rename to the storage
+        # schema (close_unadj, open, high, ...) happens in to_processed_df().
+        assert len(cleaned) == 2, "The row with Close = -1.0 should be dropped"
+        assert all(cleaned["Close"] > 0)
 
     def test_zero_volume_flagged(self):
         df = self._make_raw_df()
