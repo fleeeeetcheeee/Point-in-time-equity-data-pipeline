@@ -58,11 +58,24 @@ logging.basicConfig(
 )
 log = logging.getLogger("bootstrap")
 
+# How many tickers to accumulate before writing a batch of date partitions.
+# Trades peak memory against the number of files per partition: at 250, the
+# full ~1,100-ticker universe produces about five files per date.
+PRICE_WRITE_BATCH = 250
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Bootstrap the full historical data store.")
     p.add_argument("--start-year", type=int, default=config.start_year)
     p.add_argument("--start-quarter", type=int, default=config.start_quarter)
+    p.add_argument(
+        "--end-year", type=int, default=None,
+        help="Cap the EDGAR range (inclusive). Defaults to the latest complete quarter."
+    )
+    p.add_argument(
+        "--end-quarter", type=int, default=None,
+        help="Cap the EDGAR range (inclusive), used with --end-year."
+    )
     p.add_argument(
         "--skip-edgar", action="store_true",
         help="Skip EDGAR download + parse (use existing raw files)."
@@ -70,6 +83,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--skip-prices", action="store_true",
         help="Skip price download + clean (use existing raw files)."
+    )
+    p.add_argument(
+        "--max-tickers", type=int, default=None,
+        help="Only fetch prices for the first N tickers. For smoke runs — the full "
+             "universe is ~1,100 tickers and dominates the wall-clock time."
     )
     return p.parse_args()
 
@@ -87,11 +105,34 @@ def step_edgar(args: argparse.Namespace) -> None:
         user_agent=config.edgar_user_agent,
         rate_limit_rps=config.edgar_rate_limit_rps,
     )
-    quarters = list(downloader.iter_quarters(args.start_year, args.start_quarter))
+    quarters = list(downloader.iter_quarters(
+        args.start_year, args.start_quarter, args.end_year, args.end_quarter
+    ))
     log.info("  %d quarters to check.", len(quarters))
 
+    # One bad quarter must not kill a run that takes hours. Collect failures and
+    # report them at the end, so a partial store is still usable and the operator
+    # knows exactly which quarters to re-run.
+    failed: list[tuple[int, int, str]] = []
     for year, quarter in quarters:
-        downloader.download_quarter(year, quarter)
+        try:
+            downloader.download_quarter(year, quarter)
+        except Exception as exc:
+            log.error("  EDGAR %dq%d failed: %s", year, quarter, exc)
+            failed.append((year, quarter, str(exc)))
+
+    if failed:
+        log.warning(
+            "  %d of %d quarters failed to download: %s",
+            len(failed), len(quarters),
+            ", ".join(f"{y}q{q}" for y, q, _ in failed),
+        )
+        if len(failed) == len(quarters):
+            raise SystemExit(
+                "Every EDGAR quarter failed to download. This is normally a dead URL "
+                "or a blocked User-Agent, not bad luck — fix that before re-running "
+                "rather than letting the pipeline build a fundamentals-free store."
+            )
 
     log.info("Step 2/5: Parsing EDGAR quarters → processed fundamentals…")
     parser = EdgarParser()
@@ -121,6 +162,13 @@ def step_prices(timeline: pd.DataFrame, args: argparse.Namespace) -> None:
     log.info("Step 4/5: Downloading prices for all ever-members…")
 
     all_tickers = timeline["ticker"].unique().tolist()
+    if args.max_tickers is not None:
+        all_tickers = all_tickers[: args.max_tickers]
+        log.warning(
+            "  --max-tickers=%d: fetching a SUBSET of the universe. The resulting "
+            "store is a smoke-test artifact, not a backtestable universe.",
+            args.max_tickers,
+        )
     log.info("  %d unique tickers to fetch.", len(all_tickers))
 
     price_dl = PriceDownloader(
@@ -138,6 +186,26 @@ def step_prices(timeline: pd.DataFrame, args: argparse.Namespace) -> None:
     writer = ParquetWriter()
 
     tickers_with_data = [t for t, ok in results.items() if ok]
+
+    # Tickers are accumulated and flushed in batches rather than written one at
+    # a time. A date partition holds every ticker trading that day, so a
+    # per-ticker write overwrites the rows every previous ticker put in the
+    # partitions they share — the store would end up holding only the last
+    # ticker. Batching also keeps the file count per partition small.
+    pending: list[pl.DataFrame] = []
+    part_index = 0
+
+    def flush() -> None:
+        nonlocal pending, part_index
+        if not pending:
+            return
+        writer.write_prices(
+            pl.concat(pending), config.processed_prices_dir,
+            part_name=f"part-{part_index:04d}",
+        )
+        pending = []
+        part_index += 1
+
     for ticker in tickers_with_data:
         raw_df = price_dl.load_ohlcv(ticker)
         splits_df = price_dl.load_splits(ticker)
@@ -158,8 +226,11 @@ def step_prices(timeline: pd.DataFrame, args: argparse.Namespace) -> None:
              "volume_zero", "price_gap_flag"]
         ].dropna(subset=["close_unadj"]))
 
-        writer.write_prices(pl_df, config.processed_prices_dir)
+        pending.append(pl_df)
+        if len(pending) >= PRICE_WRITE_BATCH:
+            flush()
 
+    flush()
     log.info("  Price processing complete.")
 
 
@@ -194,12 +265,7 @@ def step_cik_map() -> None:
 def main() -> None:
     args = parse_args()
 
-    if config.edgar_user_agent == "tierzero research@example.com":
-        log.warning(
-            "SEC_USER_AGENT is not set. "
-            "Set it in .env or as an environment variable before running. "
-            "Example: SEC_USER_AGENT=\"Your Name your@email.com\""
-        )
+    config.require_real_user_agent()
 
     step_edgar(args)
     timeline = step_membership()

@@ -71,6 +71,12 @@ def update_prices() -> None:
     cleaner = PriceCleaner()
     writer = ParquetWriter()
 
+    # Collected and written once, for the same reason bootstrap batches: every
+    # ticker updated today lands in the same date partition, so a per-ticker
+    # write would leave only the last one. The fixed part name keeps a second
+    # run on the same day an overwrite rather than a duplicate.
+    pending: list[pl.DataFrame] = []
+
     for ticker in sorted(tickers):
         try:
             ok = price_dl.download_ticker(ticker)
@@ -99,10 +105,17 @@ def update_prices() -> None:
                           "close_unadj", "close_adj", "volume",
                           "volume_zero", "price_gap_flag"]].dropna(subset=["close_unadj"])
             )
-            writer.write_prices(pl_df, config.processed_prices_dir)
+            pending.append(pl_df)
 
         except Exception as exc:
             log.error("Failed to update %s: %s", ticker, exc)
+
+    if pending:
+        writer.write_prices(
+            pl.concat(pending), config.processed_prices_dir, part_name="daily"
+        )
+    else:
+        log.warning("No price rows to write — market holiday, or data not yet posted.")
 
 
 def update_edgar() -> None:
@@ -146,6 +159,7 @@ def update_membership() -> None:
 
 
 def main() -> None:
+    config.require_real_user_agent()
     log.info("Starting daily update for %s", date.today())
     update_prices()
     update_edgar()
