@@ -23,6 +23,8 @@ from typing import Iterator
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+from tierzero.config import config
+
 log = logging.getLogger(__name__)
 
 _REQUIRED_FILES = {"sub.txt", "num.txt", "tag.txt"}
@@ -32,8 +34,10 @@ class EdgarDownloader:
     """
     Downloads SEC EDGAR quarterly Financial Statement Data Set zips.
 
-    The bulk structured datasets live at:
-      https://www.sec.gov/dera/data/financial-statements/{year}q{quarter}.zip
+    The URL pattern lives in config (``edgar_bulk_url_pattern``) rather than
+    here — the SEC has relocated this dataset before, and a single definition
+    means a move is a one-line change instead of a hunt through the codebase.
+    It stays injectable so tests can point it at a local mock.
 
     Usage::
 
@@ -42,15 +46,15 @@ class EdgarDownloader:
             downloader.download_quarter(year, quarter)
     """
 
-    BULK_URL = "https://www.sec.gov/dera/data/financial-statements/{year}q{quarter}.zip"
-
     def __init__(
         self,
         output_dir: Path,
         user_agent: str,
         rate_limit_rps: float = 8.0,
+        bulk_url_pattern: str | None = None,
     ) -> None:
         self.output_dir = output_dir
+        self.bulk_url_pattern = bulk_url_pattern or config.edgar_bulk_url_pattern
         self._min_interval = 1.0 / rate_limit_rps
         self._last_request: float = 0.0
 
@@ -76,30 +80,51 @@ class EdgarDownloader:
             log.info("EDGAR %dq%d already downloaded, skipping.", year, quarter)
             return dest_dir
 
-        url = self.BULK_URL.format(year=year, quarter=quarter)
+        url = self.bulk_url_pattern.format(year=year, quarter=quarter)
         log.info("Downloading EDGAR %dq%d from %s", year, quarter, url)
 
         dest_dir.mkdir(parents=True, exist_ok=True)
         zip_path = dest_dir / "_download.zip"
 
-        self._download_file(url, zip_path)
-        self._extract(zip_path, dest_dir)
+        # A failed download must not leave a partial directory behind. _is_complete()
+        # would correctly refuse to skip it, but the debris accumulates across the
+        # hundreds of quarters a full bootstrap touches.
+        try:
+            self._download_file(url, zip_path)
+            self._extract(zip_path, dest_dir)
+        except Exception:
+            zip_path.unlink(missing_ok=True)
+            if not any(dest_dir.iterdir()):
+                dest_dir.rmdir()
+            raise
+
         zip_path.unlink(missing_ok=True)
 
         log.info("EDGAR %dq%d extracted to %s", year, quarter, dest_dir)
         return dest_dir
 
     def iter_quarters(
-        self, start_year: int, start_quarter: int
+        self,
+        start_year: int,
+        start_quarter: int,
+        end_year: int | None = None,
+        end_quarter: int | None = None,
     ) -> Iterator[tuple[int, int]]:
         """
         Yield (year, quarter) pairs from (start_year, start_quarter) up to
         the most recently completed quarter (roughly current date minus 45 days).
+
+        An optional (end_year, end_quarter) caps the range, inclusive. Without
+        it a "cheap" smoke run is only cheap in its start date — bounding the
+        end is what makes a one-quarter trial actually one quarter.
         """
         today = date.today()
         y, q = start_year, start_quarter
 
         while True:
+            if end_year is not None and (y, q) > (end_year, end_quarter or 4):
+                break
+
             # Quarter ends in month q*3; add 45-day lag for SEC processing
             quarter_end_month = q * 3
             try:
