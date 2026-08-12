@@ -141,6 +141,7 @@ class PointInTimeLookup:
         self._membership = membership
         self._ticker_cik = ticker_cik_map
         self._mb = MembershipBuilder()
+        self._last_dates: Optional[dict[str, date]] = None
 
     # ------------------------------------------------------------------
     # Primary API
@@ -153,10 +154,23 @@ class PointInTimeLookup:
         All data in the snapshot reflects only what was publicly known
         by market close on as_of_date.
         """
-        snap = EquitySnapshot(ticker=ticker, as_of_date=as_of_date)
         pit = pd.Timestamp(as_of_date)
+        return self._build_snapshot(ticker, as_of_date, pit, self._query_last_price(ticker, pit))
 
-        self._populate_price(snap, ticker, pit)
+    def _build_snapshot(
+        self, ticker: str, as_of_date: date, pit: pd.Timestamp, price_row
+    ) -> EquitySnapshot:
+        """
+        Assemble a snapshot from an already-fetched price row.
+
+        Split out from get() so get_universe() can fetch every ticker's price in
+        one query and still produce identical snapshots — there is exactly one
+        code path building an EquitySnapshot, so the batched and single-ticker
+        results cannot drift apart.
+        """
+        snap = EquitySnapshot(ticker=ticker, as_of_date=as_of_date)
+
+        self._populate_price(snap, ticker, pit, price_row)
         self._populate_index_membership(snap, ticker, pit)
 
         cik = self._resolve_cik(ticker)
@@ -189,32 +203,91 @@ class PointInTimeLookup:
             result = self._reader.query("SELECT DISTINCT ticker FROM prices ORDER BY ticker")
             tickers = result["ticker"].to_list()
 
-        return [self.get(t, as_of_date) for t in tickers]
+        # Prices for the whole universe come back in one query rather than one
+        # per ticker. Calling get() in a loop is an N+1 against a store of
+        # thousands of partitions: for a 500-name universe that was ~500 scans
+        # and over two minutes per date, which a daily-rebalance backtest would
+        # multiply by several thousand.
+        prices = self._query_last_prices(tickers, pit)
+
+        return [self._build_snapshot(t, as_of_date, pit, prices.get(t)) for t in tickers]
 
     # ------------------------------------------------------------------
     # Price population
     # ------------------------------------------------------------------
 
+    # How far back to look for the last trading day before widening the search.
+    # Prices are Hive-partitioned by date, so a bounded range lets DuckDB prune
+    # to a handful of directories. Unbounded, every lookup scans the whole store
+    # — with 25 years of history that is ~8,500 partitions per call, and it was
+    # what made get_universe() take two minutes for a single date.
+    # 10 days clears any US market holiday run; the rare gap longer than that
+    # (a suspended or thinly traded name) falls back to the full scan.
+    _LOOKBACK_DAYS = 10
+
+    _PRICE_COLUMNS = (
+        "date, open, high, low, close_unadj, close_adj, volume, "
+        "volume_zero, price_gap_flag"
+    )
+
+    def _query_last_prices(
+        self, tickers: list[str], pit: pd.Timestamp
+    ) -> dict[str, dict]:
+        """
+        Last price row on or before `pit` for many tickers, in one query.
+
+        Returns {ticker: row}. Tickers with no price at all are simply absent.
+        """
+        if not tickers:
+            return {}
+
+        upper = pit.date().isoformat()
+        lower = (pit - pd.Timedelta(days=self._LOOKBACK_DAYS)).date().isoformat()
+        quoted = ", ".join(f"'{t}'" for t in tickers)
+
+        def run(floor: str | None) -> dict[str, dict]:
+            clause = f"AND date >= '{floor}'" if floor else ""
+            result = self._reader.query(f"""
+                SELECT ticker, {self._PRICE_COLUMNS}
+                FROM (
+                    SELECT ticker, {self._PRICE_COLUMNS},
+                           ROW_NUMBER() OVER (
+                               PARTITION BY ticker ORDER BY date DESC
+                           ) AS rn
+                    FROM prices
+                    WHERE ticker IN ({quoted})
+                      AND date <= '{upper}'
+                      {clause}
+                )
+                WHERE rn = 1
+            """)
+            return {r["ticker"]: r for r in result.iter_rows(named=True)}
+
+        found = run(lower)
+
+        # Anything not seen in the recent window may still have older data —
+        # a suspended name, or a date before the store's coverage begins. Those
+        # get one extra unbounded query between them, not one apiece.
+        missing = [t for t in tickers if t not in found]
+        if missing:
+            quoted = ", ".join(f"'{t}'" for t in missing)
+            found.update(run(None))
+
+        return found
+
+    def _query_last_price(self, ticker: str, pit: pd.Timestamp) -> Optional[dict]:
+        """Last price row on or before `pit` for a single ticker."""
+        return self._query_last_prices([ticker], pit).get(ticker)
+
     def _populate_price(
-        self, snap: EquitySnapshot, ticker: str, pit: pd.Timestamp
+        self, snap: EquitySnapshot, ticker: str, pit: pd.Timestamp, row: Optional[dict]
     ) -> None:
         """
-        Fill price fields using the last available trading day on or before pit.
+        Fill price fields from the last available trading day on or before pit.
         """
-        sql = f"""
-            SELECT date, open, high, low, close_unadj, close_adj, volume,
-                   volume_zero, price_gap_flag
-            FROM prices
-            WHERE ticker = '{ticker}'
-              AND date <= '{pit.date().isoformat()}'
-            ORDER BY date DESC
-            LIMIT 1
-        """
-        result = self._reader.query(sql)
-        if result.is_empty():
+        if row is None:
             return
 
-        row = result.row(0, named=True)
         snap.close = row["close_unadj"]
         snap.close_adj = row["close_adj"]
         snap.open = row["open"]
@@ -230,13 +303,31 @@ class PointInTimeLookup:
             )
 
         # Detect delisting: is the last price in the entire series before as_of_date?
-        last_sql = f"SELECT MAX(date)::VARCHAR AS last_date FROM prices WHERE ticker = '{ticker}'"
-        last_result = self._reader.query(last_sql)
-        if not last_result.is_empty():
-            last_date_str = last_result["last_date"][0]
-            if last_date_str:
-                snap.last_trading_date = date.fromisoformat(last_date_str)
-                snap.is_delisted = snap.last_trading_date < pit.date()
+        last_traded = self._last_trading_dates().get(ticker)
+        if last_traded is not None:
+            snap.last_trading_date = last_traded
+            snap.is_delisted = last_traded < pit.date()
+
+    def _last_trading_dates(self) -> dict[str, date]:
+        """
+        Final trading date per ticker, computed once and cached.
+
+        Delisting is "the series ends before as_of_date", so this cannot use the
+        date <= pit bound and is unavoidably a full scan. Doing it per ticker
+        per date made it the second N+1 in get_universe. The price store is
+        immutable while a lookup object lives — rebuild the object after an
+        update — so one scan per instance is enough.
+        """
+        if self._last_dates is None:
+            result = self._reader.query(
+                "SELECT ticker, MAX(date)::VARCHAR AS last_date FROM prices GROUP BY ticker"
+            )
+            self._last_dates = {
+                r["ticker"]: date.fromisoformat(r["last_date"])
+                for r in result.iter_rows(named=True)
+                if r["last_date"]
+            }
+        return self._last_dates
 
     # ------------------------------------------------------------------
     # Fundamental population
