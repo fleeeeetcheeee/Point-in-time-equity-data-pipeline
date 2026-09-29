@@ -361,3 +361,21 @@ would reasonably assume it is safe.
     `filed_date` PIT anchor is applied. The leakage tests cover the gating logic on synthetic data;
     the parsing of real `num.txt`/`sub.txt` shapes is thinner. Worth fixture-based tests against a
     trimmed real quarter before the full bootstrap.
+
+## 2026-09-10 — Review findings recorded; implementation parked
+
+Retrospective record of the 2026-09-09 inspection, added at the user's request to preserve the findings for later. **No fixes started.** The [workspace backlog](../../REVIEW-BACKLOG.md) indexes every confirmed problem and suggestion; the [full review](../../REVIEW-2026-09-09.md) contains source locations, reproductions, proposed repairs and acceptance checks, with an [evidence bundle](../../review-artifacts/2026-09-09/README.md). These relative links refer to the local portfolio workspace.
+
+Open confirmed findings for this project, using the review's stable numbers:
+
+- R01: Membership reconstruction omits established constituents; saved recent membership has only 252 entries, with AAPL and IBM absent in the probes.
+- R02: EDGAR parsing loses fact-period/context identity; comparative values can overwrite current values.
+- R03: Old annual values override newer quarterly TTM information; cumulative YTD support is incomplete.
+- R04: Yahoo split-adjusted prices are treated as as-traded, and the public snapshot exposes unsafe stored adjustment.
+- R05: Date-only filing gates admit after-close filings; future metadata and inferred delisting from coverage violate the PIT contract.
+- R06: Daily updates miss bootstrap filenames, skip cached refreshes, and do not recover missed sessions/new members.
+- R07: Staged Parquet files are visible to readers; refresh publication must preserve the previous valid data.
+
+Additional suggestions: historical ticker/CIK identity, explicit empty/partial-store behavior, public-path acceptance fixtures, split-crossing pipeline/engine validation, compatible Python locks, clean-install CI, input/result provenance, documentation corrections, and a license decision if public reuse is intended. Existing open items above remain open unless already explicitly closed; the full historical bootstrap was not run.
+
+**Status correction:** earlier statements that membership is survivorship-bias-free and the broad market-close PIT done criterion is met are not supported by these reproductions. Preserve the earlier log as development history; treat this review as the later assessment until repairs are verified. The 2026-09-09 suite passed 113 tests at `8b16925`; coverage was not remeasured. Passing those tests did not establish the missing contracts. No source, data or environment changes, commits or pushes were made for this logging entry.
